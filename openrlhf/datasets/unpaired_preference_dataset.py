@@ -56,6 +56,7 @@ class UnpairedPreferenceDataset(Dataset):
         self.output_key = getattr(self.strategy.args, "output_key", None)
         self.label_key = getattr(self.strategy.args, "label_key", None)
         self.apply_chat_template = getattr(self.strategy.args, "apply_chat_template", False)
+        self.weight_key = getattr(self.strategy.args, "weight_key", "weight")
 
         if self.apply_chat_template:
             self.apply_chat_template = self.tokenizer.apply_chat_template
@@ -76,11 +77,15 @@ class UnpairedPreferenceDataset(Dataset):
         self.responses = processed_dataset["response"]
         self.labels = processed_dataset["label"]
         self.prompt_ids_lens = processed_dataset["prompt_ids_len"]
+        self.weights = processed_dataset["weight"]
 
     def process_data(self, data):
         prompt, response, label = preprocess_data(
             data, self.input_template, self.input_key, self.output_key, self.label_key, self.apply_chat_template
         )
+        weight = float(data.get(self.weight_key, 1.0))  # ✅ 新增（默认 1.0）
+        if weight < 0:
+            weight = 0.0
         prompt_token = self.tokenizer(
             prompt,
             max_length=self.max_length,
@@ -95,13 +100,13 @@ class UnpairedPreferenceDataset(Dataset):
         if prompt_ids_len >= self.max_length - 2:
             prompt = None
 
-        return {"prompt": prompt, "response": response, "label": label, "prompt_ids_len": prompt_ids_len}
+        return {"prompt": prompt, "response": response, "label": label, "prompt_ids_len": prompt_ids_len, "weight": weight}
 
     def __len__(self):
         return len(self.prompts)
 
     def __getitem__(self, index):
-        return self.prompts[index], self.responses[index], self.labels[index], self.prompt_ids_lens[index]
+        return self.prompts[index], self.responses[index], self.labels[index], self.prompt_ids_lens[index], self.weights[index],
 
     def collate_fn(self, item_list):
         def tokenizer(prompt, response):
@@ -121,13 +126,14 @@ class UnpairedPreferenceDataset(Dataset):
             inputs["attention_mask"][0][-1] = True
             return inputs["input_ids"], inputs["attention_mask"]
 
-        tot_ids, tot_masks, tot_labels, prompt_ids_lens = [], [], [], []
-        for prompt, response, label, prompt_ids_len in item_list:
+        tot_ids, tot_masks, tot_labels, prompt_ids_lens, tot_weights = [], [], [], [], []
+        for prompt, response, label, prompt_ids_len, weight in item_list:
             input_ids, attention_mask = tokenizer(prompt, response)
             tot_ids.append(input_ids)
             tot_masks.append(attention_mask)
             tot_labels.append(label)
             prompt_ids_lens.append(prompt_ids_len)
+            tot_weights.append(float(weight))
 
         # add unmatched y'| x (used to estimate the KL divergence between policy and reference)
         for idx in range(len(item_list)):
@@ -137,7 +143,8 @@ class UnpairedPreferenceDataset(Dataset):
             tot_masks.append(attention_mask)
             tot_labels.append(-1)
             prompt_ids_lens.append(item_list[idx][3])
+            tot_weights.append(0.0)
 
         input_ids = zero_pad_sequences(tot_ids, side="right", value=self.tokenizer.pad_token_id)
         attention_mask = zero_pad_sequences(tot_masks, side="right")
-        return input_ids, attention_mask, torch.LongTensor(tot_labels), prompt_ids_lens
+        return input_ids, attention_mask, torch.LongTensor(tot_labels), prompt_ids_lens, torch.tensor(tot_weights, dtype=torch.float32)

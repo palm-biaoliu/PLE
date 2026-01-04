@@ -316,6 +316,8 @@ class KTOLoss(nn.Module):
         reference_chosen_logps: torch.FloatTensor,
         reference_rejected_logps: torch.FloatTensor,
         reference_KL_logps: torch.FloatTensor,
+        chosen_weights: Optional[torch.FloatTensor] = None,    # ✅ 新增
+        rejected_weights: Optional[torch.FloatTensor] = None,  # ✅ 新增
     ) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
         KL = (policy_KL_logps - reference_KL_logps).mean().detach()
         # all_reduce sums up the KL estimates across all devices (gradient will also be scaled by world size)
@@ -340,10 +342,31 @@ class KTOLoss(nn.Module):
             # important to cast to policy_dtype; otherwise error will occur during all_gather
             rejected_losses = torch.Tensor([]).to(policy_chosen_logps.dtype).to(self.device)
             rejected_rewards = torch.Tensor([]).to(policy_chosen_logps.dtype).to(self.device)
+        
+        # --- weights default ---
+        if chosen_weights is None:
+            chosen_weights = torch.ones_like(chosen_losses)
+        if rejected_weights is None:
+            rejected_weights = torch.ones_like(rejected_losses)
 
-        losses = torch.cat(
-            (self.desirable_weight * chosen_losses, self.undesirable_weight * rejected_losses), 0
-        ).mean()
+        chosen_weights = chosen_weights.to(device=chosen_losses.device, dtype=chosen_losses.dtype)
+        rejected_weights = rejected_weights.to(device=rejected_losses.device, dtype=rejected_losses.dtype)
+
+        num = (
+            self.desirable_weight * (chosen_losses * chosen_weights).sum()
+            + self.undesirable_weight * (rejected_losses * rejected_weights).sum()
+        )
+        den = (
+            self.desirable_weight * chosen_weights.sum()
+            + self.undesirable_weight * rejected_weights.sum()
+        )
+
+        losses = num / (den + 1e-8)
+
+
+        # losses = torch.cat(
+        #     (self.desirable_weight * chosen_losses, self.undesirable_weight * rejected_losses), 0
+        # ).mean()
         return losses, chosen_rewards, rejected_rewards, KL
 
 

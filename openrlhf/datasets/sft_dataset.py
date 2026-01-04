@@ -94,7 +94,7 @@ class SFTDataset(Dataset):
         if self.multiturn:
             assert (
                 not self.output_key or not data[self.output_key]
-            ), "You should put the whole trajactory into data[input_key] and do not set output_key"
+            ), "You should put the whole trajectory into data[input_key] and do not set output_key"
             input_key = self.input_key
             apply_chat_template = self.apply_chat_template
             response_ranges = []
@@ -173,6 +173,9 @@ class SFTDataset(Dataset):
     def __getitem__(self, idx):
         prompt = self.prompts[idx]
         response = self.responses[idx]
+        info = {}
+        info["input"] = prompt
+        info["output"] = response
 
         if not self.pretrain_mode:
             text = (prompt + response).rstrip("\n")
@@ -197,7 +200,7 @@ class SFTDataset(Dataset):
             # to avoid EOS_token truncation
             input_ids[0][-1] = self.tokenizer.eos_token_id
             attention_mask[0][-1] = True
-        return input_ids, attention_mask, loss_mask
+        return input_ids, attention_mask, loss_mask, info
 
     def get_loss_mask(self, input_ids, idx):
         if self.pretrain_mode:
@@ -217,13 +220,15 @@ class SFTDataset(Dataset):
         input_ids = []
         attention_masks = []
         loss_masks = []
+        infos = []
 
-        for input_id, attention_mask, loss_mask in item_list:
+        for input_id, attention_mask, loss_mask, info in item_list:
             input_ids.append(input_id)
             attention_masks.append(attention_mask)
             loss_masks.append(loss_mask)
+            infos.append(info)
 
         input_ids = zero_pad_sequences(input_ids, "right", self.tokenizer.pad_token_id)
         attention_masks = zero_pad_sequences(attention_masks, "right")
         loss_masks = zero_pad_sequences(loss_masks, "right")
-        return input_ids, attention_masks, loss_masks
+        return input_ids, attention_masks, loss_masks, infos

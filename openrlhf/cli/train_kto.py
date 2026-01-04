@@ -206,6 +206,9 @@ if __name__ == "__main__":
         "--undesirable_loss_weight", type=float, default=1.0, help="Loss weight for undesirable samples"
     )
 
+    parser.add_argument("--weight_key", type=str, default="weight", help="JSON dataset key for per-sample weight")
+
+
     # Custom dataset
     parser.add_argument("--dataset", type=str, default=None, help="Path to the training dataset")
     parser.add_argument("--dataset_probs", type=str, default=None, help="Sampling probabilities for training datasets")
@@ -249,7 +252,7 @@ if __name__ == "__main__":
 
     if args.input_template and "\\n" in args.input_template:
         print(
-            "[Warning] input_template contains \\n chracters instead of newline. "
+            "[Warning] input_template contains \\n characters instead of newline. "
             "You likely want to pass $'\\n' in Bash or \"`n\" in PowerShell."
         )
 

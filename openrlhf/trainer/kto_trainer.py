@@ -128,9 +128,22 @@ class KTOTrainer(ABC):
             self.ref_model.eval()
 
             # train
-            for input_ids, attention_mask, labels, prompt_ids_lens in self.train_dataloader:
+            for input_ids, attention_mask, labels, prompt_ids_lens, weights in self.train_dataloader:
+                device = torch.cuda.current_device()
                 input_ids = input_ids.squeeze(1).to(torch.cuda.current_device())
                 attention_mask = attention_mask.squeeze(1).to(torch.cuda.current_device())
+
+                # ✅ 关键：labels 必须上 GPU（否则后面 GPU tensor 用 CPU mask 会炸）
+                labels = labels.to(device)
+                # ✅ weights 上 GPU（float）
+                weights = weights.to(device, dtype=torch.float32)
+
+                # ✅ 关键：KTO 里前半是 matched（用于 preference loss），后半是 unmatched（用于 KL）
+                hsize = input_ids.shape[0] // 2
+                front_labels = labels[:hsize]
+                front_weights = weights[:hsize]
+                chosen_weights = front_weights[front_labels == 1]    # 对齐 chosen_logps
+                rejected_weights = front_weights[front_labels == 0]  # 对齐 rejected_logps
 
                 # make sure local batch size >= 2 (to pack unmatched examples)
                 policy_returns = self.compute_model_logps_with_KL(
@@ -150,6 +163,8 @@ class KTOTrainer(ABC):
                     ref_returns[0],
                     ref_returns[1],
                     ref_returns[2],
+                    chosen_weights=chosen_weights,
+                    rejected_weights=rejected_weights,
                 )
 
                 # mixtral
@@ -217,6 +232,7 @@ class KTOTrainer(ABC):
             if self.save_hf_ckpt:
                 save_path = os.path.join(args.ckpt_path, f"{tag}_hf")
                 self.strategy.save_model(self.model, self.tokenizer, save_path)
+    
 
     def evaluate(self, eval_dataloader, steps=0):
         self.model.eval()
@@ -227,23 +243,39 @@ class KTOTrainer(ABC):
                 disable=not self.strategy.is_rank_0(),
             )
 
-            loss_sum = 0
-            chosen_reward, reject_reward = 0, 0
-            for input_ids, attention_mask, labels, prompt_ids_lens in eval_dataloader:
-                input_ids = input_ids.squeeze(1).to(torch.cuda.current_device())
-                attention_mask = attention_mask.squeeze(1).to(torch.cuda.current_device())
+            loss_sum = 0.0
+            chosen_reward_sum, reject_reward_sum = 0.0, 0.0
+
+            # ✅ dataloader 需要吐出 weights
+            for input_ids, attention_mask, labels, prompt_ids_lens, weights in eval_dataloader:
+                device = torch.cuda.current_device()
+
+                input_ids = input_ids.squeeze(1).to(device)
+                attention_mask = attention_mask.squeeze(1).to(device)
+
+                # ✅ labels/weights 上 GPU
+                labels = labels.to(device)
+                weights = weights.to(device, dtype=torch.float32)
+
+                # ✅ 前半 matched（用于 preference loss），后半 unmatched（用于 KL）
+                hsize = input_ids.shape[0] // 2
+                front_labels = labels[:hsize]
+                front_weights = weights[:hsize]
+
+                chosen_weights = front_weights[front_labels == 1]
+                rejected_weights = front_weights[front_labels == 0]
 
                 # make sure local batch size >= 2 (to pack unmatched examples)
                 policy_returns = self.compute_model_logps_with_KL(
                     self.model, input_ids, attention_mask, labels, prompt_ids_lens
                 )
-                aux_loss = policy_returns[3]
+                aux_loss = policy_returns[3]  # eval里通常不用，但保留结构一致
 
-                with torch.no_grad():
-                    ref_returns = self.compute_model_logps_with_KL(
-                        self.ref_model, input_ids, attention_mask, labels, prompt_ids_lens
-                    )
+                ref_returns = self.compute_model_logps_with_KL(
+                    self.ref_model, input_ids, attention_mask, labels, prompt_ids_lens
+                )
 
+                # ✅ 传入 sample weights
                 kto_loss, chosen_rewards, rejected_rewards, KL = self.loss_fn(
                     policy_returns[0],
                     policy_returns[1],
@@ -251,16 +283,21 @@ class KTOTrainer(ABC):
                     ref_returns[0],
                     ref_returns[1],
                     ref_returns[2],
+                    chosen_weights=chosen_weights,
+                    rejected_weights=rejected_weights,
                 )
 
-                chosen_reward += chosen_rewards.mean().item()
-                reject_reward += rejected_rewards.mean().item()
-                loss_sum += kto_loss.item()
+                # 记录
+                loss_sum += float(kto_loss.item())
+                chosen_reward_sum += chosen_rewards.mean().item() if len(chosen_rewards) != 0 else 0.0
+                reject_reward_sum += rejected_rewards.mean().item() if len(rejected_rewards) != 0 else 0.0
+
                 step_bar.update()
 
-            loss_mean = loss_sum / eval_dataloader.__len__()
-            chosen_reward = chosen_reward / eval_dataloader.__len__()
-            reject_reward = reject_reward / eval_dataloader.__len__()
+            denom = max(1, eval_dataloader.__len__())
+            loss_mean = loss_sum / denom
+            chosen_reward = chosen_reward_sum / denom
+            reject_reward = reject_reward_sum / denom
 
             logs = {"eval_loss": loss_mean, "chosen_reward": chosen_reward, "reject_reward": reject_reward}
             logs = self.strategy.all_reduce(logs)
@@ -273,7 +310,66 @@ class KTOTrainer(ABC):
                 elif self._tensorboard is not None:
                     for k, v in logs.items():
                         self._tensorboard.add_scalar(f"eval/{k}", v, steps)
+
         self.model.train()
+
+
+    # def evaluate(self, eval_dataloader, steps=0):
+    #     self.model.eval()
+    #     with torch.no_grad():
+    #         step_bar = tqdm(
+    #             range(eval_dataloader.__len__()),
+    #             desc="Eval stage of global_step %d" % steps,
+    #             disable=not self.strategy.is_rank_0(),
+    #         )
+
+    #         loss_sum = 0
+    #         chosen_reward, reject_reward = 0, 0
+    #         for input_ids, attention_mask, labels, prompt_ids_lens in eval_dataloader:
+    #             input_ids = input_ids.squeeze(1).to(torch.cuda.current_device())
+    #             attention_mask = attention_mask.squeeze(1).to(torch.cuda.current_device())
+
+    #             # make sure local batch size >= 2 (to pack unmatched examples)
+    #             policy_returns = self.compute_model_logps_with_KL(
+    #                 self.model, input_ids, attention_mask, labels, prompt_ids_lens
+    #             )
+    #             aux_loss = policy_returns[3]
+
+    #             with torch.no_grad():
+    #                 ref_returns = self.compute_model_logps_with_KL(
+    #                     self.ref_model, input_ids, attention_mask, labels, prompt_ids_lens
+    #                 )
+
+    #             kto_loss, chosen_rewards, rejected_rewards, KL = self.loss_fn(
+    #                 policy_returns[0],
+    #                 policy_returns[1],
+    #                 policy_returns[2],
+    #                 ref_returns[0],
+    #                 ref_returns[1],
+    #                 ref_returns[2],
+    #             )
+
+    #             chosen_reward += chosen_rewards.mean().item()
+    #             reject_reward += rejected_rewards.mean().item()
+    #             loss_sum += kto_loss.item()
+    #             step_bar.update()
+
+    #         loss_mean = loss_sum / eval_dataloader.__len__()
+    #         chosen_reward = chosen_reward / eval_dataloader.__len__()
+    #         reject_reward = reject_reward / eval_dataloader.__len__()
+
+    #         logs = {"eval_loss": loss_mean, "chosen_reward": chosen_reward, "reject_reward": reject_reward}
+    #         logs = self.strategy.all_reduce(logs)
+    #         step_bar.set_postfix(logs)
+
+    #         if self.strategy.is_rank_0():
+    #             if self._wandb is not None:
+    #                 logs = {"eval/%s" % k: v for k, v in {**logs, "global_step": steps}.items()}
+    #                 self._wandb.log(logs)
+    #             elif self._tensorboard is not None:
+    #                 for k, v in logs.items():
+    #                     self._tensorboard.add_scalar(f"eval/{k}", v, steps)
+    #     self.model.train()
 
     def compute_model_logps_with_KL(self, model, input_ids, attention_mask, labels, prompt_id_lens):
         """

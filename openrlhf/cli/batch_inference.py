@@ -14,6 +14,125 @@ from openrlhf.models import Actor, get_llm_for_sequence_regression
 from openrlhf.utils import get_processor, get_strategy, get_tokenizer
 
 
+# ==================== 新增：计算 Log-Probs 的函数 ====================
+def batch_log_probs(args):
+    """
+    计算数据集里每个回答在给定模型下的总 log-probability。
+    """
+    strategy = get_strategy(args)
+    strategy.setup_distributed(timeout=timedelta(minutes=180))
+
+    # 加载 Actor 模型（Policy 或 Ref）
+    model = Actor(
+        args.pretrain,
+        use_flash_attention_2=args.attn_implementation,
+        bf16=args.bf16,
+    )
+
+    # 配置 Tokenizer
+    tokenizer = get_tokenizer(args.pretrain, model.model, "right", strategy, use_fast=not args.disable_fast_tokenizer)
+
+    # 准备模型
+    model = strategy.prepare(model)
+    model.eval()
+
+    # 加载待评估的数据集（通常是包含 input 和 output 的生成数据）
+    dataset = blending_datasets(
+        args.dataset,
+        args.dataset_probs,
+        strategy,
+        args.seed,
+        max_count=args.max_samples,
+    )
+    dataset = dataset.select(range(min(args.max_samples, len(dataset))))
+    
+    # 使用 SFTDataset 来处理 prompt + output 的拼接
+    sft_dataset = SFTDataset(
+        dataset, tokenizer, args.max_len, strategy, pretrain_mode=False, input_template=args.input_template
+    )
+    dataloader = strategy.setup_dataloader(
+        sft_dataset, args.micro_batch_size, True, False, sft_dataset.collate_fn, drop_last=False
+    )
+    
+    pbar = tqdm(
+        dataloader,
+        desc=f"Calculating Log-Probs ({args.label})",
+        disable=not strategy.is_rank_0(),
+    )
+
+    dist.barrier()
+
+    output_dataset = []
+    with torch.no_grad():
+        for input_ids, attention_masks, _, info in pbar:
+            input_ids = input_ids.squeeze(1).to(torch.cuda.current_device())
+            attention_masks = attention_masks.squeeze(1).to(torch.cuda.current_device())
+            
+            # 前向传播获取 logits
+            # OpenRLHF 的 Actor 模型在 return_logprobs=True 时会返回经过 log_softmax 的值
+            output = model(input_ids, attention_mask=attention_masks, return_output=True)
+            logits = output.logits
+
+            # 计算 log_probs: (batch, seq_len, vocab_size)
+            log_probs = F.log_softmax(logits, dim=-1)
+
+            # 获取对应的 label (input_ids 右移一位)
+            labels = input_ids[:, 1:].contiguous()
+            log_probs = log_probs[:, :-1, :]
+
+            # 提取每个 token 的 log_prob
+            per_token_logps = torch.gather(log_probs, dim=2, index=labels.unsqueeze(2)).squeeze(2)
+
+            # 掩码逻辑：只计算 Response 部分，排除 Prompt 和 Padding
+            # SFTDataset 的 info 里包含每个 sample 的 prompt 长度
+            # 注意：OpenRLHF 的 SFTDataset 可能通过不同的 key 传递长度，这里需要对应
+            for i in range(input_ids.size(0)):
+                # 寻找 prompt 结束的位置（通常是第一个非 mask 的位置 + prompt 长度，或者基于 label 掩码）
+                # 这里我们利用 attention_mask 和 info 中的 prompt 长度进行过滤
+                # 假设 SFTDataset 在 info 里存了 prompt 的 token 数
+                prompt_len = info["prompt_len"][i] if "prompt_len" in info else 0
+                
+                mask = attention_masks[i, 1:].clone()
+                mask[:prompt_len-1] = False # 掩盖掉 prompt 部分
+                
+                # 求和得到该回答的总 log_prob
+                total_logp = (per_token_logps[i] * mask).sum().item()
+                
+                # 组装数据，添加 logp_{label} 字段
+                res_obj = {
+                    "input": info["input"][i],
+                    "output": info["output"][i],
+                }
+                # 如果输入原本就有 reward 等字段，保留它们
+                for key in info:
+                    if key not in ["input", "output", "prompt_len"]:
+                        res_obj[key] = info[key][i]
+                
+                # 动态添加 label (如 logp_policy 或 logp_ref)
+                res_obj[f"logp_{args.label}"] = total_logp
+                output_dataset.append(res_obj)
+
+    # 结果收集与保存逻辑 (参考 batch_rm_inference)
+    os.makedirs(os.path.dirname(args.output_path), exist_ok=True)
+    with jsonlines.open(args.output_path + str(strategy.get_rank()), mode="w") as writer:
+        writer.write_all(output_dataset)
+
+    dist.barrier()
+
+    if strategy.is_rank_0():
+        all_data = []
+        world_size = dist.get_world_size()
+        for rank in range(world_size):
+            file = args.output_path + str(rank)
+            with jsonlines.open(file, mode="r") as reader:
+                for obj in reader:
+                    all_data.append(obj)
+            os.remove(file)
+
+        with jsonlines.open(args.output_path, mode="w") as writer:
+            writer.write_all(all_data)
+# =====================================================================
+
 def batch_generate_vllm(args):
     from vllm import LLM, SamplingParams
 
@@ -37,7 +156,6 @@ def batch_generate_vllm(args):
         seed=args.seed,
         max_num_seqs=args.max_num_seqs,
         enable_prefix_caching=args.enable_prefix_caching,
-         gpu_memory_utilization=0.7,
     )
 
     # Create a sampling params object.
@@ -246,12 +364,14 @@ def batch_rm_inference(args):
 
     output_dataset = []
     with torch.no_grad():
-        for _, input_ids, attention_masks, info in pbar:
+        for input_ids, attention_masks, _, info in pbar:
             input_ids = input_ids.squeeze(1).to(torch.cuda.current_device())
             attention_masks = attention_masks.squeeze(1).to(torch.cuda.current_device())
             rewards = model(input_ids, attention_masks)
-            for prompt, output, reward in zip(info["input"], info["output"], rewards):
-                output_dataset.append({"input": prompt, "output": output, "reward": reward.item()})
+            for item, reward in zip(info, rewards):
+                output_dataset.append({"input": item["input"], "output": item["output"], "reward": reward.item()})
+            # for prompt, output, reward in zip(info["input"], info["output"], rewards):
+            #     output_dataset.append({"input": prompt, "output": output, "reward": reward.item()})
 
             dist.barrier()
 
@@ -340,12 +460,26 @@ if __name__ == "__main__":
         "--post_processor",
         type=str,
         default=None,
-        help="set to rs (Rejection Sampling), csft (Conditional SFT), iter_dpo (Iterative DPO), percentile_dpo (percentile_dpo_processor) or None",
+        help="set to rs (Rejection Sampling), csft (Conditional SFT), iter_dpo (Iterative DPO) or None",
     )
     # For vllm
     parser.add_argument("--tp_size", type=int, default=torch.cuda.device_count())
     parser.add_argument("--max_num_seqs", type=int, default=256)
     parser.add_argument("--enable_prefix_caching", action="store_true", default=False)
+
+    parser.add_argument(
+        "--top_reward_diff_percentile",
+        type=float,
+        default=1.0,
+        help="Percentile for selecting top reward differences.",
+    )
+
+    parser.add_argument(
+        "--sigmoid_temperature",
+        type=float,
+        default=1.0,
+        help="Temperature for sigmoid weighting.",
+    )
 
     # For Iterative generation and Rejection Sampling
     parser.add_argument(
@@ -356,32 +490,74 @@ if __name__ == "__main__":
     )
     parser.add_argument("--rollout_batch_size", type=int, default=2048, help="Number of samples to generate")
 
+    # ==================== START OF MODIFICATION ====================
+    # 为迭代式加权DPO添加的参数
+    parser.add_argument(
+        "--selection_percentage",
+        type=float,
+        default=1.0, # 默认为1.0，即所有数据权重都为1，保持原始行为
+        help="Percentage of top reward-margin data to use with full loss weight (e.g., 0.1 for 10%)."
+    )
+    parser.add_argument(
+        "--low_loss_weight",
+        type=float,
+        default=0.1, # 剩余数据的权重
+        help="Loss weight for the remaining data (not in the top percentage)."
+    )
+    # ===================== END OF MODIFICATION =====================
+
+    # ==================== 新增参数 ====================
+    parser.add_argument(
+        "--label",
+        type=str,
+        default="policy",
+        help="Label for log-probs (e.g., 'policy' or 'ref'). Will save as logp_{label}"
+    )
+    # =================================================
+
+
+
     # For Conditional SFT
-    parser.add_argument("--normalize_reward", action="store_true", default=False, help="Enable Reward Normazation")
+    parser.add_argument("--normalize_reward", action="store_true", default=False, help="Enable Reward Normalization")
     parser.add_argument("--reward_template", type=str, default=None)
     parser.add_argument("--enable_csft", action="store_true", default=False)
     parser.add_argument("--csft_prompt", type=str, default="<rm_score>: 5.00", help="Conditional SFT prompt")
 
+    parser.add_argument(
+    "--low_priority_weight",
+    type=float,
+    default=0.1,  # 默认的低优先级权重值
+    help="用于 weighted_reward_diff_processor, 为非 top 百分位的数据设置损失权重。",
+)
+
+
     # ModelScope parameters
     parser.add_argument("--use_ms", action="store_true", default=False)
 
-    #设置阈值
-    parser.add_argument(
-        "--pairing_percentile",
-        type=float,
-        default=0.1,  # 默认值设为 10%
-        help="用于 percentile_dpo_processor 的百分位阈值，例如 0.1 表示选择奖励前10%和后10%的回答进行配对"
-    )
-
     args = parser.parse_args()
-    if args.eval_task and args.eval_task == "generate":
+
+    # ==================== 修改分发逻辑 ====================
+    if args.eval_task == "generate":
         batch_generate(args)
-    if args.eval_task and args.eval_task == "generate_vllm":
+    elif args.eval_task == "generate_vllm":
         batch_generate_vllm(args)
-    elif args.eval_task and args.eval_task == "rm":
+    elif args.eval_task == "rm":
         batch_rm_inference(args)
+    elif args.eval_task == "log_probs": # 新增分发
+        batch_log_probs(args)
     else:
-        print("Invalid or missing '--eval_task' argument. Please specify either 'generate' or 'rm'.")
+        print("Invalid eval_task.")
+    # =====================================================
+
+
+    # if args.eval_task and args.eval_task == "generate":
+    #     batch_generate(args)
+    # if args.eval_task and args.eval_task == "generate_vllm":
+    #     batch_generate_vllm(args)
+    # elif args.eval_task and args.eval_task == "rm":
+    #     batch_rm_inference(args)
+    # else:
+    #     print("Invalid or missing '--eval_task' argument. Please specify either 'generate' or 'rm'.")
 
     if args.use_ms:
         from modelscope.utils.hf_util import patch_hub
