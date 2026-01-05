@@ -17,24 +17,34 @@
 
 
 
+## 🚧 Code Release Notice
 
+本仓库提供 PLE 在 OpenRLHF 框架下的代码实现。  
+下面给出从零开始运行默认实验脚本的完整步骤。
 
-## **🚧 Code Release Notice**
-
-
+```bash
 # 克隆仓库
 git clone https://github.com/palm-biaoliu/PLE.git
 cd PLE
 
-#（可选）创建虚拟环境
-# conda create -n ple python=3.10
-# conda activate ple
+# 创建并激活虚拟环境（可选）
+conda create -n ple python=3.10
+conda activate ple
 
 # 安装依赖
 pip install -r requirements.txt
-# 或者（如果你用的是 pyproject）
+# 或者（如果你使用的是 pyproject）
 # pip install -e .
 
-# 默认的运行脚本位于 examples/scripts/run_ple.sh
+# 运行默认脚本
 cd examples/scripts
 bash run_ple.sh
+```
+
+
+
+
+
+
+
+
